@@ -1648,19 +1648,6 @@ final class KotlinBridgeToKotlinVisitor {
     /// view's dynamic property kinds — found at runtime by field reflection — and sync each by
     /// index instead.
     private func swiftUIEvaluateDynamic(_ swiftUIType: TypeSignature.SwiftUIType, for classDeclaration: KotlinClassDeclaration) -> [KotlinStatement] {
-        let functionDeclaration = KotlinFunctionDeclaration(name: "Evaluate")
-        var functionParameters: [Parameter<KotlinExpression>] = []
-        if swiftUIType != .view && swiftUIType != .toolbarContent {
-            functionParameters.append(Parameter<KotlinExpression>(externalLabel: "content", declaredType: .named("skip.ui.View", [])))
-        }
-        functionParameters.append(Parameter<KotlinExpression>(externalLabel: "context", declaredType: .named("skip.ui.ComposeContext", [])))
-        functionParameters.append(Parameter<KotlinExpression>(externalLabel: "options", declaredType: .int))
-        functionDeclaration.parameters = functionParameters
-        functionDeclaration.returnType = .named("kotlin.collections.List", [.named("Renderable", [])])
-        functionDeclaration.modifiers = Modifiers(visibility: .public, isOverride: true)
-        functionDeclaration.attributes.attributes.append(Attribute(signature: .named("androidx.compose.runtime.Composable", [])))
-        functionDeclaration.extras = .singleNewline
-
         // One kind code per property, in the order SkipSwiftUI indexes them. `key` gives each
         // property's rememberSaveable its own saved-state key.
         let peer = ClassType(classDeclaration).peerExternalArgument
@@ -1681,13 +1668,7 @@ final class KotlinBridgeToKotlinVisitor {
         bodyKotlin.append("        }")
         bodyKotlin.append("    }")
         bodyKotlin.append("}")
-        if swiftUIType != .view && swiftUIType != .toolbarContent {
-            bodyKotlin.append("return super.Evaluate(content, context, options)")
-        } else {
-            bodyKotlin.append("return super.Evaluate(context, options)")
-        }
-        functionDeclaration.body = KotlinCodeBlock(statements: bodyKotlin.map { KotlinRawStatement(sourceCode: $0) })
-        return [functionDeclaration]
+        return [swiftUIEvaluateDeclaration(swiftUIType, body: bodyKotlin)]
     }
 
     /// The external functions the dynamic `Evaluate` syncs properties through, each forwarding
@@ -1735,7 +1716,8 @@ final class KotlinBridgeToKotlinVisitor {
         return (statements, cdeclFunctions)
     }
 
-    private func swiftUIEvaluate(_ swiftUIType: TypeSignature.SwiftUIType, for classDeclaration: KotlinClassDeclaration, stateVariables: [(name: String, attributes: Attributes, modifiers: Modifiers)]) -> [KotlinStatement] {
+    /// An `Evaluate` override that runs `body`, then defers to `super`.
+    private func swiftUIEvaluateDeclaration(_ swiftUIType: TypeSignature.SwiftUIType, body: [String]) -> KotlinFunctionDeclaration {
         let functionDeclaration = KotlinFunctionDeclaration(name: "Evaluate")
         var functionParameters: [Parameter<KotlinExpression>] = []
         if swiftUIType != .view && swiftUIType != .toolbarContent {
@@ -1749,6 +1731,17 @@ final class KotlinBridgeToKotlinVisitor {
         functionDeclaration.attributes.attributes.append(Attribute(signature: .named("androidx.compose.runtime.Composable", [])))
         functionDeclaration.extras = .singleNewline
 
+        var bodyKotlin = body
+        if swiftUIType != .view && swiftUIType != .toolbarContent {
+            bodyKotlin.append("return super.Evaluate(content, context, options)")
+        } else {
+            bodyKotlin.append("return super.Evaluate(context, options)")
+        }
+        functionDeclaration.body = KotlinCodeBlock(statements: bodyKotlin.map { KotlinRawStatement(sourceCode: $0) })
+        return functionDeclaration
+    }
+
+    private func swiftUIEvaluate(_ swiftUIType: TypeSignature.SwiftUIType, for classDeclaration: KotlinClassDeclaration, stateVariables: [(name: String, attributes: Attributes, modifiers: Modifiers)]) -> [KotlinStatement] {
         let classType = ClassType(classDeclaration)
         var bodyKotlin: [String] = []
         for (name, attributes, _) in stateVariables {
@@ -1762,13 +1755,7 @@ final class KotlinBridgeToKotlinVisitor {
                 bodyKotlin.append("Swift_syncEnvironment_\(name)(\(classType.peerExternalArgument), envvalue\(name))")
             }
         }
-        if swiftUIType != .view && swiftUIType != .toolbarContent {
-            bodyKotlin.append("return super.Evaluate(content, context, options)")
-        } else {
-            bodyKotlin.append("return super.Evaluate(context, options)")
-        }
-        functionDeclaration.body = KotlinCodeBlock(statements: bodyKotlin.map { KotlinRawStatement(sourceCode: $0) })
-        return [functionDeclaration]
+        return [swiftUIEvaluateDeclaration(swiftUIType, body: bodyKotlin)]
     }
 
     private func swiftUIInitState(_ swiftUIType: TypeSignature.SwiftUIType, for name: String, in classDeclaration: KotlinClassDeclaration, supportTypeName: String, boxName: String, attributes: Attributes, modifiers: Modifiers) -> (statements: [KotlinStatement], swift: [String], cdeclFunctions: [CDeclFunction]) {
