@@ -1648,8 +1648,9 @@ final class KotlinBridgeToKotlinVisitor {
     /// view's dynamic property kinds — found at runtime by field reflection — and sync each by
     /// index instead.
     private func swiftUIEvaluateDynamic(_ swiftUIType: TypeSignature.SwiftUIType, for classDeclaration: KotlinClassDeclaration) -> [KotlinStatement] {
-        // One kind code per property, in the order SkipSwiftUI indexes them. `key` gives each
-        // property's rememberSaveable its own saved-state key.
+        // One kind code per property, in the order SkipSwiftUI indexes them. The codes are
+        // SkipSwiftUI's (`Java_dynamicPropertyKinds`): 0 state, 1 app storage, 2 environment.
+        // `key` gives each property's rememberSaveable its own saved-state key.
         let peer = ClassType(classDeclaration).peerExternalArgument
         var bodyKotlin: [String] = []
         bodyKotlin.append("val dynamicPropertyKinds = Swift_dynamicPropertyKinds(\(peer))")
