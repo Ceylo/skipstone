@@ -1588,40 +1588,48 @@ final class KotlinBridgeToKotlinVisitor {
             guard case .swiftUIStateProperty(let name, let attributes, let modifiers) = unbridged else {
                 return nil
             }
-            guard modifiers.visibility >= .default else {
-                classDeclaration.messages.append(.kotlinBridgeStatePrivate(classDeclaration, property: name, source: syntaxTree.source))
-                return nil
-            }
             return (name, attributes, modifiers)
         }
+        // A `private`/`fileprivate` property has no name the generated bridge file can reach,
+        // so any one of those switches the *whole* view to syncing by runtime-discovered index
+        // instead of by name. A view with only internal-or-wider properties keeps today's
+        // per-name code path, unchanged.
+        let hasPrivateStateVariable = stateVariables.contains { $0.2.visibility < .default }
         if !stateVariables.isEmpty {
-            statements += swiftUIEvaluate(swiftUIType, for: classDeclaration, stateVariables: stateVariables)
-            for (name, attributes, modifiers) in stateVariables {
-                var initStatements: [KotlinStatement] = []
-                var syncStatements: [KotlinStatement] = []
-                var initSwift: [String] = []
-                var syncSwift: [String] = []
-                var initCdeclFunctions: [CDeclFunction] = []
-                var syncCdeclFunctions: [CDeclFunction] = []
-                if attributes.stateAttribute != nil || attributes.contains(.focusState) || attributes.contains(.gestureState) || attributes.contains(.appStorage) {
-                    let supportTypeName: String
-                    let boxName: String
-                    if attributes.contains(.appStorage) {
-                        supportTypeName = "AppStorageSupport"
-                        boxName = "appStorageBox"
-                    } else {
-                        supportTypeName = "StateSupport"
-                        boxName = "valueBox"
+            if hasPrivateStateVariable {
+                statements += swiftUIEvaluateDynamic(swiftUIType, for: classDeclaration)
+                let (dynamicStatements, dynamicCdeclFunctions) = swiftUIDynamicPropertyFunctions(for: classDeclaration)
+                statements += dynamicStatements
+                cdeclFunctions += dynamicCdeclFunctions
+            } else {
+                statements += swiftUIEvaluate(swiftUIType, for: classDeclaration, stateVariables: stateVariables)
+                for (name, attributes, modifiers) in stateVariables {
+                    var initStatements: [KotlinStatement] = []
+                    var syncStatements: [KotlinStatement] = []
+                    var initSwift: [String] = []
+                    var syncSwift: [String] = []
+                    var initCdeclFunctions: [CDeclFunction] = []
+                    var syncCdeclFunctions: [CDeclFunction] = []
+                    if attributes.stateAttribute != nil || attributes.contains(.focusState) || attributes.contains(.gestureState) || attributes.contains(.appStorage) {
+                        let supportTypeName: String
+                        let boxName: String
+                        if attributes.contains(.appStorage) {
+                            supportTypeName = "AppStorageSupport"
+                            boxName = "appStorageBox"
+                        } else {
+                            supportTypeName = "StateSupport"
+                            boxName = "valueBox"
+                        }
+                        (initStatements, initSwift, initCdeclFunctions) = swiftUIInitState(swiftUIType, for: name, in: classDeclaration, supportTypeName: supportTypeName, boxName: boxName, attributes: attributes, modifiers: modifiers)
+                        (syncStatements, syncSwift, syncCdeclFunctions) = swiftUISyncState(swiftUIType, for: name, in: classDeclaration, supportTypeName: supportTypeName, boxName: boxName, attributes: attributes, modifiers: modifiers)
+                    } else if attributes.environmentAttribute != nil {
+                        (initStatements, initSwift, initCdeclFunctions) = swiftUIInitEnvironment(swiftUIType, for: name, in: classDeclaration, attributes: attributes, modifiers: modifiers)
+                        (syncStatements, syncSwift, syncCdeclFunctions) = swiftUISyncEnvironment(swiftUIType, for: name, in: classDeclaration, attributes: attributes, modifiers: modifiers)
                     }
-                    (initStatements, initSwift, initCdeclFunctions) = swiftUIInitState(swiftUIType, for: name, in: classDeclaration, supportTypeName: supportTypeName, boxName: boxName, attributes: attributes, modifiers: modifiers)
-                    (syncStatements, syncSwift, syncCdeclFunctions) = swiftUISyncState(swiftUIType, for: name, in: classDeclaration, supportTypeName: supportTypeName, boxName: boxName, attributes: attributes, modifiers: modifiers)
-                } else if attributes.environmentAttribute != nil {
-                    (initStatements, initSwift, initCdeclFunctions) = swiftUIInitEnvironment(swiftUIType, for: name, in: classDeclaration, attributes: attributes, modifiers: modifiers)
-                    (syncStatements, syncSwift, syncCdeclFunctions) = swiftUISyncEnvironment(swiftUIType, for: name, in: classDeclaration, attributes: attributes, modifiers: modifiers)
+                    statements += initStatements + syncStatements
+                    swift += initSwift + syncSwift
+                    cdeclFunctions += initCdeclFunctions + syncCdeclFunctions
                 }
-                statements += initStatements + syncStatements
-                swift += initSwift + syncSwift
-                cdeclFunctions += initCdeclFunctions + syncCdeclFunctions
             }
         }
 
@@ -1630,7 +1638,101 @@ final class KotlinBridgeToKotlinVisitor {
         swift += bodySwift
         cdeclFunctions += bodyCdeclFunctions
 
-        return (stateVariables, statements, swift, cdeclFunctions)
+        // The dynamic path syncs by index, not by name, so the generic type-erased peer (below)
+        // must not be given per-name properties to close over.
+        return (hasPrivateStateVariable ? [] : stateVariables, statements, swift, cdeclFunctions)
+    }
+
+    /// The `Evaluate` body when at least one state or environment property is private: rather
+    /// than syncing each property through a per-name Swift function, ask SkipSwiftUI for the
+    /// view's dynamic property kinds — found at runtime by field reflection — and sync each by
+    /// index instead.
+    private func swiftUIEvaluateDynamic(_ swiftUIType: TypeSignature.SwiftUIType, for classDeclaration: KotlinClassDeclaration) -> [KotlinStatement] {
+        let functionDeclaration = KotlinFunctionDeclaration(name: "Evaluate")
+        var functionParameters: [Parameter<KotlinExpression>] = []
+        if swiftUIType != .view && swiftUIType != .toolbarContent {
+            functionParameters.append(Parameter<KotlinExpression>(externalLabel: "content", declaredType: .named("skip.ui.View", [])))
+        }
+        functionParameters.append(Parameter<KotlinExpression>(externalLabel: "context", declaredType: .named("skip.ui.ComposeContext", [])))
+        functionParameters.append(Parameter<KotlinExpression>(externalLabel: "options", declaredType: .int))
+        functionDeclaration.parameters = functionParameters
+        functionDeclaration.returnType = .named("kotlin.collections.List", [.named("Renderable", [])])
+        functionDeclaration.modifiers = Modifiers(visibility: .public, isOverride: true)
+        functionDeclaration.attributes.attributes.append(Attribute(signature: .named("androidx.compose.runtime.Composable", [])))
+        functionDeclaration.extras = .singleNewline
+
+        // One kind code per property, in the order SkipSwiftUI indexes them. `key` gives each
+        // property's rememberSaveable its own saved-state key.
+        let peer = ClassType(classDeclaration).peerExternalArgument
+        var bodyKotlin: [String] = []
+        bodyKotlin.append("val dynamicPropertyKinds = Swift_dynamicPropertyKinds(\(peer))")
+        bodyKotlin.append("for (i in 0 until dynamicPropertyKinds.length) {")
+        bodyKotlin.append("    androidx.compose.runtime.key(i) {")
+        bodyKotlin.append("        when (dynamicPropertyKinds[i]) {")
+        bodyKotlin.append("            '0' -> {")
+        bodyKotlin.append("                val remembered = androidx.compose.runtime.saveable.rememberSaveable(stateSaver = context.stateSaver as androidx.compose.runtime.saveable.Saver<skip.ui.StateSupport, Any>) { androidx.compose.runtime.mutableStateOf(Swift_initDynamicState(\(peer), i)) }")
+        bodyKotlin.append("                Swift_syncDynamicState(\(peer), i, remembered.value)")
+        bodyKotlin.append("            }")
+        bodyKotlin.append("            '1' -> {")
+        bodyKotlin.append("                val remembered = androidx.compose.runtime.saveable.rememberSaveable(stateSaver = context.stateSaver as androidx.compose.runtime.saveable.Saver<skip.ui.AppStorageSupport, Any>) { androidx.compose.runtime.mutableStateOf(Swift_initDynamicAppStorage(\(peer), i)) }")
+        bodyKotlin.append("                Swift_syncDynamicAppStorage(\(peer), i, remembered.value)")
+        bodyKotlin.append("            }")
+        bodyKotlin.append("            else -> Swift_syncDynamicEnvironment(\(peer), i, skip.ui.EnvironmentValues.shared.bridged(Swift_dynamicEnvironmentKey(\(peer), i)))")
+        bodyKotlin.append("        }")
+        bodyKotlin.append("    }")
+        bodyKotlin.append("}")
+        if swiftUIType != .view && swiftUIType != .toolbarContent {
+            bodyKotlin.append("return super.Evaluate(content, context, options)")
+        } else {
+            bodyKotlin.append("return super.Evaluate(context, options)")
+        }
+        functionDeclaration.body = KotlinCodeBlock(statements: bodyKotlin.map { KotlinRawStatement(sourceCode: $0) })
+        return [functionDeclaration]
+    }
+
+    /// The external functions the dynamic `Evaluate` syncs properties through, each forwarding
+    /// to SkipSwiftUI's generic, index-based implementation.
+    private func swiftUIDynamicPropertyFunctions(for classDeclaration: KotlinClassDeclaration) -> (statements: [KotlinStatement], cdeclFunctions: [CDeclFunction]) {
+        let classType = ClassType(classDeclaration)
+        let view = classType == .generic ? "peer_swift.genericvalue" : classType.peerSwiftTarget
+        let index = TypeSignature.Parameter(label: "index", type: .int32)
+        let functions: [(name: String, kotlinParameters: String, kotlinReturn: String, parameters: [TypeSignature.Parameter], returnType: TypeSignature, body: [String])] = [
+            ("Swift_dynamicPropertyKinds", "", ": String", [], .javaString, [
+                "return Java_dynamicPropertyKinds(\(view)).toJavaObject(options: [])!"
+            ]),
+            ("Swift_initDynamicState", ", index: Int", ": skip.ui.StateSupport", [index], .javaObjectPointer, [
+                "return Java_initDynamicState(\(view), Int(index)).toJavaObject(options: [])!"
+            ]),
+            ("Swift_syncDynamicState", ", index: Int, support: skip.ui.StateSupport", "", [index, TypeSignature.Parameter(label: "support", type: .javaObjectPointer)], .void, [
+                "Java_syncDynamicState(\(view), Int(index), SkipUI.StateSupport.fromJavaObject(support, options: []))"
+            ]),
+            ("Swift_initDynamicAppStorage", ", index: Int", ": skip.ui.AppStorageSupport", [index], .javaObjectPointer, [
+                "return Java_initDynamicAppStorage(\(view), Int(index)).toJavaObject(options: [])!"
+            ]),
+            ("Swift_syncDynamicAppStorage", ", index: Int, support: skip.ui.AppStorageSupport", "", [index, TypeSignature.Parameter(label: "support", type: .javaObjectPointer)], .void, [
+                "Java_syncDynamicAppStorage(\(view), Int(index), SkipUI.AppStorageSupport.fromJavaObject(support, options: []))"
+            ]),
+            ("Swift_dynamicEnvironmentKey", ", index: Int", ": String", [index], .javaString, [
+                "return Java_dynamicEnvironmentKey(\(view), Int(index)).toJavaObject(options: [])!"
+            ]),
+            ("Swift_syncDynamicEnvironment", ", index: Int, support: skip.ui.EnvironmentSupport?", "", [index, TypeSignature.Parameter(label: "support", type: .optional(.javaObjectPointer))], .void, [
+                "Java_syncDynamicEnvironment(\(view), Int(index), SkipUI.EnvironmentSupport?.fromJavaObject(support, options: []))"
+            ]),
+        ]
+
+        var statements: [KotlinStatement] = []
+        var cdeclFunctions: [CDeclFunction] = []
+        for function in functions {
+            let externalFunctionDeclaration = KotlinRawStatement(sourceCode: "private external fun \(function.name)(\(classType.peerExternalParameter)\(function.kotlinParameters))\(function.kotlinReturn)")
+            externalFunctionDeclaration.parent = classDeclaration
+            statements.append(externalFunctionDeclaration)
+
+            let (cdecl, cdeclName) = CDeclFunction.declaration(for: externalFunctionDeclaration, isCompanion: false, name: function.name, translator: translator)
+            let cdeclSignature: TypeSignature = .function([classType.peerSwiftParameter] + function.parameters, function.returnType, APIFlags(), nil)
+            let cdeclSource = classType.peerSwiftAssignment(to: classDeclaration, optionsString: "[]") + function.body
+            cdeclFunctions.append(CDeclFunction(name: cdeclName, cdecl: cdecl, signature: cdeclSignature, body: cdeclSource))
+        }
+        return (statements, cdeclFunctions)
     }
 
     private func swiftUIEvaluate(_ swiftUIType: TypeSignature.SwiftUIType, for classDeclaration: KotlinClassDeclaration, stateVariables: [(name: String, attributes: Attributes, modifiers: Modifiers)]) -> [KotlinStatement] {
