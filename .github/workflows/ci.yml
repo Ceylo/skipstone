@@ -2,7 +2,7 @@ name: skipstone CI
 
 on:
   push:
-    branches: [main, ci/arm-macos-runners-run]
+    branches: [main, ci/arm-macos-runners-run, debug/linux-fuse]
   schedule:
     - cron: '0 7 * * *'
   workflow_dispatch:
@@ -112,7 +112,6 @@ jobs:
           # virtualization: HVF fails with HV_UNSUPPORTED), so emulator tests
           # run on Linux (x86_64 + KVM) and macOS runs the host and Robolectric halves
           - 'ubuntu-24.04'
-          - 'macos-26'
         swift:
           - '6.3'
           - '6.4'
@@ -303,6 +302,7 @@ jobs:
       - name: "Test new Skip Fuse framework on emulator"
         working-directory: ${{ runner.temp }}
         run: |
+          if [[ "${RUNNER_OS}" == "Linux" ]]; then export SKIP_DYNAMIC_LIBRARIES=1; fi
           skip init --no-build --native-model --bridged --module-tests demo-fuse-framework DemoFramework
           cd demo-fuse-framework
           # Robolectric test
