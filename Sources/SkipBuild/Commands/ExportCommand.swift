@@ -93,12 +93,6 @@ Build and export the Skip modules defined in the Package.swift, with libraries e
     @Option(help: ArgumentHelp("Destination architectures for native libraries", valueName: "arch"))
     var arch: [AndroidArchArgument] = []
 
-    @Flag(inversion: .prefixedNo, help: ArgumentHelp("Generate appindex.json metadata alongside export artifacts"))
-    var appindex: Bool = false
-
-    @Flag(inversion: .prefixedNo, help: ArgumentHelp("Create a symlink from app Resources to the generated appindex.json"))
-    var linkAppindex: Bool = true
-
     @Flag(inversion: .prefixedNo, help: ArgumentHelp("Unpack the exported app project zip into a temp folder and run `gradle assembleDebug` there to confirm the export builds standalone without Skip installed"))
     var validateExport: Bool = false
 
@@ -137,15 +131,13 @@ Build and export the Skip modules defined in the Package.swift, with libraries e
                 return try await run(with: out, "Getting SDK Path", "xcrun --sdk iphoneos --show-sdk-path".split(separator: " ").map(\.description), watch: false).get().stdout.trimmingCharacters(in: .whitespacesAndNewlines)
             }
 
-            // see HostSwiftBuild for why the environment and build system are set here
+            // see HostSwiftBuild for why the environment is set here
             if let sdk = try? await fetchSDKPath(), sdk != "legacy" {
-                let buildSystem = await HostSwiftBuild.buildSystemArguments(swiftCommand: ["xcrun", "swift"])
-                try await run(with: out, "Build project \(packageName)", ["xcrun", "swift", "build", "-v", "--package-path", project, "--triple", "arm64-apple-ios", "--sdk", sdk] + buildSystem, additionalEnvironment: HostSwiftBuild.environment)
+                try await run(with: out, "Build project \(packageName)", ["xcrun", "swift", "build", "-v", "--package-path", project, "--triple", "arm64-apple-ios", "--sdk", sdk], additionalEnvironment: HostSwiftBuild.environment)
             } else {
                 // fallback to plain "swift build" for legacy build, which has the down-side that it will build against macOS (and thereby fail when there are iOS-only API calls): "Basics/Triple+Basics.swift:149: Fatal error: Cannot create dynamic libraries for os "ios".", also @availability annotations are required for everything
                 // however, it permits us to build and export against macOS-13/Xcode 15.2 (which is the OS version needed for GitHub CI to be able to run tests against the Android Emulator using the reactivecircus/android-emulator-runner action),
-                let buildSystem = await HostSwiftBuild.buildSystemArguments()
-                try await run(with: out, "Build project \(packageName)", ["swift", "build", "-v", "--package-path", project] + buildSystem, additionalEnvironment: HostSwiftBuild.environment)
+                try await run(with: out, "Build project \(packageName)", ["swift", "build", "-v", "--package-path", project], additionalEnvironment: HostSwiftBuild.environment)
             }
         } else {
             try await run(with: out, "Resolve dependencies", ["swift", "package", "resolve", "-v", "--package-path", project])
@@ -189,16 +181,6 @@ Build and export the Skip modules defined in the Package.swift, with libraries e
             }
 
             let projectLayout = try AppProjectLayout(moduleName: appModuleName, root: projectURL, check: validateLayoutURL)
-
-            // Generate and link app index before building so it is included in the app bundle
-            if self.appindex {
-                let catalog = try await AppIndexGenerator.generateAppIndex(projectURL: projectURL, packageJSON: packageJSON, includeSBOM: true, command: self, out: out)
-                try fs.createDirectory(outputFolderAbsolute, recursive: true)
-                let appIndexURL = outputFolderAbsolute.asURL.appendingPathComponent(AppIndexGenerator.appIndexFilename)
-                let indexURL = try await AppIndexGenerator.writeAppIndex(catalog, to: appIndexURL, linkResource: self.linkAppindex, appModuleName: appModuleName, projectURL: projectURL, out: out)
-                createdURLs.append(indexURL)
-                await out.write(status: .pass, "Generated \(AppIndexGenerator.appIndexFilename)")
-            }
 
             // Resolve the scheme name once for all iOS builds
             let appSchemeName = (self.ios || self.iosSim) ? try await resolveAppSchemeName(schemeName: self.schemeName, xcodeProjectURL: projectLayout.darwinProjectFolder, out: out) : nil

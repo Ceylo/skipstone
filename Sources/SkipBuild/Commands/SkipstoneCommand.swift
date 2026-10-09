@@ -231,12 +231,11 @@ struct SkipstoneCommand: BuildPluginOptionsCommand, StreamingCommand {
 
         // always touch the sourcehash file with the most recent source hashes in order to update the output file time
         /// Create a link from the source to the destination; this is used for resources and custom Kotlin files in order to permit edits to target file and have them reflected in the original source
-        func addLink(_ linkSource: AbsolutePath, pointingAt destPath: AbsolutePath, relative: Bool, replace: Bool = true, copyReadOnlyFiles: Bool = true) throws {
+        func addLink(_ linkSource: AbsolutePath, pointingAt destPath: AbsolutePath, relative: Bool, copyReadOnlyFiles: Bool = true) throws {
             msg(.trace, "linking: \(linkSource) to: \(destPath)")
 
-            if replace && fs.isSymlink(destPath) {
-                removePath(destPath) // clear any pre-existing symlink
-            }
+            // note that destPath may itself be a symlink (e.g., a resource that links to a generated file),
+            // so it must be left in place; any pre-existing link at linkSource is replaced below
 
             if let existingSymlinkDestination = try? FileManager.default.destinationOfSymbolicLink(atPath: linkSource.pathString) {
                 if existingSymlinkDestination == destPath.pathString {
@@ -606,7 +605,7 @@ struct SkipstoneCommand: BuildPluginOptionsCommand, StreamingCommand {
             func useLocalPackage(named packageName: String, id packageID: String, dependencies: inout [Package.Dependency]) {
                 func localDependency(name: String?, location: String) -> Package.Dependency? {
                     if name == packageID || location.hasSuffix("/" + packageID) || location.hasSuffix("/" + packageID + ".git") {
-                        return Package.Dependency.package(path: "Packages/" + packageID)
+                        return Package.Dependency.package(path: (Context.environment["SKIP_LOCAL_PACKAGES_PATH"] ?? "Packages") + "/" + packageID)
                     } else {
                         return nil
                     }
